@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,8 @@ import (
 	gitconfig "github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -1473,6 +1476,164 @@ func TestGitTokenStoreCorruptionRecoveryPreservesOnlyNonConflictingLocalChanges(
 	})
 }
 
+func TestGitTokenStoreMissingPackedAncestorRecoveryPreservesDirtyAuth(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master",
+		testBranchSpec{name: "master", contents: "remote original\n"},
+	)
+	repoDir := filepath.Join(root, "workspace")
+	store := NewGitTokenStore(remoteDir, "", "", "")
+	store.SetBaseDir(filepath.Join(repoDir, "auths"))
+	if errEnsure := store.EnsureRepository(); errEnsure != nil {
+		t.Fatalf("EnsureRepository: %v", errEnsure)
+	}
+
+	repo, errOpen := git.PlainOpen(repoDir)
+	if errOpen != nil {
+		t.Fatalf("open repository before repack: %v", errOpen)
+	}
+	if errRepack := repo.RepackObjects(&git.RepackConfig{}); errRepack != nil {
+		t.Fatalf("repack repository objects: %v", errRepack)
+	}
+	if errClose := repo.Close(); errClose != nil {
+		t.Fatalf("close repacked repository: %v", errClose)
+	}
+	objectsDir := filepath.Join(repoDir, ".git", "objects")
+	objectEntries, errReadDir := os.ReadDir(objectsDir)
+	if errReadDir != nil {
+		t.Fatalf("read object directory: %v", errReadDir)
+	}
+	for _, entry := range objectEntries {
+		if entry.IsDir() && len(entry.Name()) == 2 {
+			if errRemove := os.RemoveAll(filepath.Join(objectsDir, entry.Name())); errRemove != nil {
+				t.Fatalf("remove loose object directory %s: %v", entry.Name(), errRemove)
+			}
+		}
+	}
+
+	repo, errOpen = git.PlainOpen(repoDir)
+	if errOpen != nil {
+		t.Fatalf("reopen repository before loose head commit: %v", errOpen)
+	}
+	worktree, errWorktree := repo.Worktree()
+	if errWorktree != nil {
+		t.Fatalf("open worktree before loose head commit: %v", errWorktree)
+	}
+	if _, errRemove := worktree.Remove("branch.txt"); errRemove != nil {
+		t.Fatalf("remove packed head file: %v", errRemove)
+	}
+	if errWrite := os.WriteFile(filepath.Join(repoDir, "loose-head.txt"), []byte("loose head\n"), 0o600); errWrite != nil {
+		t.Fatalf("write loose head file: %v", errWrite)
+	}
+	if _, errAdd := worktree.Add("loose-head.txt"); errAdd != nil {
+		t.Fatalf("add loose head file: %v", errAdd)
+	}
+	if _, errCommit := worktree.Commit("Create loose head", &git.CommitOptions{Author: &object.Signature{
+		Name: "CLIProxyAPI", Email: "cliproxy@local", When: time.Unix(1711929600, 0),
+	}}); errCommit != nil {
+		t.Fatalf("commit loose head: %v", errCommit)
+	}
+	if errClose := repo.Close(); errClose != nil {
+		t.Fatalf("close repository after loose head commit: %v", errClose)
+	}
+
+	dirtyAuthPath := filepath.Join(store.AuthDir(), "dirty.json")
+	dirtyAuthContents := `{"type":"codex","access_token":"local-dirty"}`
+	if errWrite := os.WriteFile(dirtyAuthPath, []byte(dirtyAuthContents), 0o600); errWrite != nil {
+		t.Fatalf("write dirty auth: %v", errWrite)
+	}
+	advanceRemoteBranch(t, filepath.Join(root, "seed"), remoteDir, "master", "remote updated\n", "Update remote")
+
+	repo, errOpen = git.PlainOpen(repoDir)
+	if errOpen != nil {
+		t.Fatalf("reopen repository before pull: %v", errOpen)
+	}
+	worktree, errWorktree = repo.Worktree()
+	if errWorktree != nil {
+		t.Fatalf("open worktree before pull: %v", errWorktree)
+	}
+	if errVerify := verifyRepositoryHead(repo); errVerify != nil {
+		t.Fatalf("verify loose repository head: %v", errVerify)
+	}
+	head, errHead := repo.Head()
+	if errHead != nil {
+		t.Fatalf("read loose repository head: %v", errHead)
+	}
+	headCommit, errCommit := repo.CommitObject(head.Hash())
+	if errCommit != nil {
+		t.Fatalf("read loose head commit: %v", errCommit)
+	}
+	headTree, errTree := headCommit.Tree()
+	if errTree != nil {
+		t.Fatalf("read loose head tree: %v", errTree)
+	}
+	dirtyPaths, errDirty := worktreeDirtyPaths(worktree)
+	if errDirty != nil {
+		t.Fatalf("read dirty paths: %v", errDirty)
+	}
+	packfiles, errGlob := filepath.Glob(filepath.Join(objectsDir, "pack", "*.pack"))
+	if errGlob != nil {
+		t.Fatalf("glob packfiles: %v", errGlob)
+	}
+	if len(packfiles) == 0 {
+		t.Fatal("no packfiles found to remove")
+	}
+	for _, packfile := range packfiles {
+		if errRemove := os.Remove(packfile); errRemove != nil {
+			t.Fatalf("remove packfile %s: %v", filepath.Base(packfile), errRemove)
+		}
+	}
+
+	errPull := worktree.Pull(&git.PullOptions{RemoteName: "origin"})
+	if !errors.Is(errPull, fs.ErrNotExist) {
+		t.Fatalf("Pull error = %v, want missing pack error", errPull)
+	}
+	if !isRepositoryCorruptionError(repo, errPull) {
+		t.Fatalf("Pull error = %T %v, want repository corruption", errPull, errPull)
+	}
+	if errRecover := store.recoverRepositoryLocked(repoDir, nil, repo, headTree, dirtyPaths, (*git.Repository).Close, os.Rename); errRecover != nil {
+		t.Fatalf("recoverRepositoryLocked: %v", errRecover)
+	}
+
+	assertLocalFileContents(t, filepath.Join(repoDir, "branch.txt"), "remote updated\n")
+	assertLocalFileContents(t, dirtyAuthPath, dirtyAuthContents)
+}
+
+func TestRepositoryCorruptionClassificationIsLocal(t *testing.T) {
+	repoDir := t.TempDir()
+	repo, errInit := git.PlainInit(repoDir, false)
+	if errInit != nil {
+		t.Fatalf("init repository: %v", errInit)
+	}
+	defer func() {
+		if errClose := repo.Close(); errClose != nil {
+			t.Errorf("close repository: %v", errClose)
+		}
+	}()
+	packName := "pack-0123456789012345678901234567890123456789.pack"
+	remotePack := filepath.Join(t.TempDir(), "objects", "pack", packName)
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "packfile sentinel", err: dotgit.ErrPackfileNotFound, want: true},
+		{name: "object sentinel", err: plumbing.ErrObjectNotFound, want: true},
+		{name: "local missing pack", err: &fs.PathError{Op: "statat", Path: filepath.Join("objects", "pack", packName), Err: fs.ErrNotExist}, want: true},
+		{name: "remote missing pack", err: &fs.PathError{Op: "stat", Path: remotePack, Err: fs.ErrNotExist}},
+		{name: "missing auth file", err: &fs.PathError{Op: "open", Path: filepath.Join(repoDir, "auths", "missing.json"), Err: fs.ErrNotExist}},
+		{name: "pack permission failure", err: &fs.PathError{Op: "statat", Path: filepath.Join("objects", "pack", packName), Err: fs.ErrPermission}},
+		{name: "authentication failure", err: transport.ErrAuthenticationRequired},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isRepositoryCorruptionError(repo, test.err); got != test.want {
+				t.Fatalf("isRepositoryCorruptionError() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestGitTokenStoreFullPackfileCorruptionFailsClosedWithDirtyManagedFile(t *testing.T) {
 	setup := func(t *testing.T) (string, string, *GitTokenStore) {
 		t.Helper()
@@ -1786,7 +1947,7 @@ func removeHeadFileObject(t *testing.T, repoDir, path string) {
 	if errRemove := os.Remove(objectPath); errRemove != nil {
 		t.Fatalf("remove repository object for %s: %v", path, errRemove)
 	}
-	if errVerify := verifyRepositoryHead(repo); !isRepositoryCorruptionError(errVerify) {
+	if errVerify := verifyRepositoryHead(repo); !isRepositoryCorruptionError(repo, errVerify) {
 		t.Fatalf("verifyRepositoryHead error = %v, want repository corruption", errVerify)
 	}
 }
@@ -1841,7 +2002,7 @@ func corruptGitRepository(t *testing.T, repoDir string) {
 	if errOpen != nil {
 		t.Fatalf("reopen corrupted repository: %v", errOpen)
 	}
-	if errVerify := verifyRepositoryHead(repo); !isRepositoryCorruptionError(errVerify) {
+	if errVerify := verifyRepositoryHead(repo); !isRepositoryCorruptionError(repo, errVerify) {
 		t.Fatalf("verifyRepositoryHead error = %v, want repository corruption", errVerify)
 	}
 }
