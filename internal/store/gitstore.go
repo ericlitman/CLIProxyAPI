@@ -21,6 +21,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
+	gitfilesystem "github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -241,7 +242,7 @@ func (s *GitTokenStore) ensureRepositoryLocked() (errResult error) {
 			return fmt.Errorf("git token store: worktree: %w", errWorktree)
 		}
 		if errVerify := verifyRepositoryHead(repo); errVerify != nil {
-			if !isRepositoryCorruptionError(errVerify) {
+			if !isRepositoryCorruptionError(repo, errVerify) {
 				s.dirLock.Unlock()
 				return fmt.Errorf("git token store: verify repository before pull: %w", errVerify)
 			}
@@ -308,7 +309,7 @@ func (s *GitTokenStore) ensureRepositoryLocked() (errResult error) {
 			switch {
 			case errors.Is(errPull, git.NoErrAlreadyUpToDate):
 				if errReset := resetIndexToHead(repo, worktree); errReset != nil {
-					if !isRepositoryCorruptionError(errReset) {
+					if !isRepositoryCorruptionError(repo, errReset) {
 						s.dirLock.Unlock()
 						return fmt.Errorf("git token store: repair index after up-to-date pull: %w", errReset)
 					}
@@ -326,7 +327,7 @@ func (s *GitTokenStore) ensureRepositoryLocked() (errResult error) {
 					return fmt.Errorf("git token store: reconcile pull without a local branch")
 				}
 				if errReconcile := reconcileRemoteWorktree(repo, worktree, repoDir, prePullHead, dirtyPaths); errReconcile != nil {
-					if !isRepositoryCorruptionError(errReconcile) {
+					if !isRepositoryCorruptionError(repo, errReconcile) {
 						s.dirLock.Unlock()
 						return fmt.Errorf("git token store: reconcile remote changes: %w", errReconcile)
 					}
@@ -347,7 +348,7 @@ func (s *GitTokenStore) ensureRepositoryLocked() (errResult error) {
 					return fmt.Errorf("git token store: pull: %w", errPull)
 				}
 				// Ignore missing references only when following the remote default branch.
-			case isRepositoryCorruptionError(errPull):
+			case isRepositoryCorruptionError(repo, errPull):
 				errRecover := s.recoverRepositoryLocked(repoDir, authMethod, repo, prePullTree, dirtyPaths, (*git.Repository).Close, os.Rename)
 				repo = nil
 				if errRecover != nil {
@@ -362,7 +363,7 @@ func (s *GitTokenStore) ensureRepositoryLocked() (errResult error) {
 		}
 		if !repositoryRecovered {
 			if errVerify := verifyRepositoryHead(repo); errVerify != nil {
-				if !isRepositoryCorruptionError(errVerify) {
+				if !isRepositoryCorruptionError(repo, errVerify) {
 					s.dirLock.Unlock()
 					return fmt.Errorf("git token store: verify repository after pull: %w", errVerify)
 				}
@@ -1523,8 +1524,29 @@ func rollbackRecoveredGitDirectory(gitDir, backupGitDir string) error {
 	return nil
 }
 
-func isRepositoryCorruptionError(err error) bool {
-	return errors.Is(err, dotgit.ErrPackfileNotFound) || errors.Is(err, plumbing.ErrObjectNotFound)
+func isRepositoryCorruptionError(repo *git.Repository, err error) bool {
+	if errors.Is(err, dotgit.ErrPackfileNotFound) || errors.Is(err, plumbing.ErrObjectNotFound) {
+		return true
+	}
+	if repo == nil || !errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	var pathError *fs.PathError
+	if !errors.As(err, &pathError) {
+		return false
+	}
+	storage, ok := repo.Storer.(*gitfilesystem.Storage)
+	if !ok {
+		return false
+	}
+	objectRoot := filepath.Clean(filepath.Join(storage.Filesystem().Root(), "objects"))
+	missingPath := filepath.Clean(pathError.Path)
+	if !filepath.IsAbs(missingPath) {
+		missingPath = filepath.Join(storage.Filesystem().Root(), missingPath)
+	}
+	packDir := filepath.Join(objectRoot, "pack")
+	packName := filepath.Base(missingPath)
+	return filepath.Dir(missingPath) == packDir && strings.HasPrefix(packName, "pack-") && filepath.Ext(packName) == ".pack"
 }
 
 func verifyRepositoryHead(repo *git.Repository) error {
